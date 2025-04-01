@@ -1,0 +1,181 @@
+# Loop-BI Development Plan
+
+This document outlines the development plan for the Loop-BI analytics platform, focusing on fetching data from the DeBank API, storing it in Supabase, and presenting analytics via a Streamlit application.
+
+**Project Goal:** Provide analytics on LoopFi protocol usage and user behavior based on DeBank data.
+
+**Key Technologies:**
+*   **Data Source:** DeBank Pro API
+*   **Data Storage:** Supabase (PostgreSQL)
+*   **Backend/Processing:** Python (`requests`, `supabase-py`, `pandas`)
+*   **Frontend:** Streamlit
+
+**Core Metrics to Compute:**
+1.  ✅ Average Deposit Size (Lending / Looping - requires interpretation of position data)
+2.  ✅ Most Used Assets to Deposit (Chain, Lending asset, Looping asset)
+3.  ✅ Risk Tolerance for Leverage (Loop Factor Distribution/Average)
+4.  ✅ User Token Holdings Distribution (Pie chart by chain/token)
+5.  ✅ Other Protocol Usage by LoopFi Users (e.g., % using Pendle)
+6.  ✅ Borrowing vs. Lending Ratio (Protocol Utilization Rate approximation)
+7.  ✅ Average Net Worth of LoopFi Users (based on DeBank total balance)
+8.  ✅ TVL Distribution (Whales vs. Smaller Users)
+9.  ✅ Portfolio Strategy Analysis (Distribution of Staked, Yield, and Leveraged Farming positions)
+10. ✅ Chain Comparison (Side-by-side analytics across different chains)
+11. ✅ User Behavior Analysis (Classifying users into behavior segments)
+12. ⏳ Time Spent in a Position (Average Lending Duration) - Requires schema update with timestamp tracking
+
+---
+
+## Development Phases
+
+**Phase 1: Setup & Configuration (Estimate: 1-2 hours)**
+
+1.  **Project Structure:**
+    *   ✅ Create directories: `app/`, `core/`, `scripts/`, `config/`.
+    *   ✅ Create `.gitignore` (include `.env`).
+2.  **Dependencies:**
+    *   ✅ Create `requirements.txt` (`streamlit`, `supabase-py`, `pandas`, `python-dotenv`, `requests`, `plotly`).
+    *   ✅ Set up a Python virtual environment (`venv`).
+    *   ✅ Install dependencies: `pip install -r requirements.txt`.
+    *   ✅ Freeze dependencies: `pip freeze > requirements.txt`.
+3.  **Configuration:**
+    *   ✅ Create `.env.template` file for API keys (`DEBANK_ACCESS_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`).
+    *   ✅ **Verify LoopFi Protocol ID:** Confirm the correct DeBank protocol ID for LoopFi (identified as `loopfixyz`).
+4.  **Supabase Setup:**
+    *   ✅ Define initial table schemas in `config/database_schema.sql`.
+    *   ✅ Create a new Supabase project and execute the schema SQL.
+
+**Phase 2: Data Fetching & Storage Implementation (Estimate: 4-8 hours)**
+
+1.  **Core Supabase Client:**
+    *   ✅ Implement `core/supabase_client.py` to initialize and provide the Supabase client instance using `.env` variables.
+2.  **DeBank API Interaction Script:**
+    *   ✅ Implement `scripts/fetch_debank_data.py` with functions to interact with necessary DeBank API endpoints.
+    *   ✅ Handle authentication (`AccessKey` header).
+    *   ✅ Implement robust error handling and logging.
+    *   ✅ Handle pagination for endpoints like `/v1/protocol/top_holders`.
+3.  **Data Fetching Logic:**
+    *   ✅ **Step 2.1: Fetch LoopFi Users:** Implement logic to call `/v1/protocol/top_holders` for LoopFi.
+    *   ✅ **Step 2.2: Fetch User Details (Iterate through users):**
+        *   ✅ **2.2.a LoopFi Positions:** Call `/v1/user/protocol` for each user/LoopFi.
+        *   ✅ **2.2.b Total Balance:** Call `/v1/user/total_balance`.
+        *   ✅ **2.2.c Token Holdings:** Call `/v1/user/all_token_list`.
+        *   ✅ **2.2.d Other Protocols:** Call `/v1/user/all_complex_protocol_list`.
+    *   ✅ **Step 2.3: Fetch LoopFi Protocol Data:** Call `/v1/protocol`.
+4.  **Scheduling/Triggering:**
+    *   ✅ Implement `scripts/run_pipeline.py` with command-line arguments for running the full pipeline or parts of it.
+    *   ✅ Set up logging for data collection processes.
+
+**Phase 3: Analytics Computation (Estimate: 3-6 hours)**
+
+1.  **Analytics Module (`core/analytics.py`):**
+    *   ✅ Create functions that take the Supabase client as input.
+    *   ✅ Each function queries the necessary Supabase tables and computes one or more of the target metrics.
+    *   ✅ Use Pandas DataFrames for intermediate processing.
+    *   ✅ **Implemented Functions:**
+        *   ✅ `calculate_average_deposit_size(supabase_client)`
+        *   ✅ `get_most_used_assets(supabase_client)`
+        *   ✅ `calculate_loop_factors(supabase_client)`
+        *   ✅ `get_user_token_distribution(supabase_client)`
+        *   ✅ `get_other_protocol_usage(supabase_client)`
+        *   ✅ `calculate_utilization_rate(supabase_client)`
+        *   ✅ `calculate_average_net_worth(supabase_client)`
+        *   ✅ `calculate_whale_distribution(supabase_client)`
+        *   ✅ `get_position_duration(supabase_client)` (with fallback for missing data)
+        *   ✅ `get_portfolio_strategy_analysis(supabase_client)`
+        *   ✅ `compare_chains_metrics(supabase_client)`
+        *   ✅ `analyze_user_behavior(supabase_client)`
+2.  **Data Formatting:**
+    *   ✅ Ensure functions return data in formats easily consumable by Streamlit.
+
+**Phase 4: Streamlit UI Development (Estimate: 4-8 hours)**
+
+1.  **Basic App Structure (`app/main_app.py`):**
+    *   ✅ Set up basic Streamlit layout (title, sidebar, main area).
+    *   ✅ Initialize Supabase client.
+2.  **Data Loading & Caching:**
+    *   ✅ Call functions from `core/analytics.py` to get computed metrics.
+    *   ✅ Use Streamlit's caching (`@st.cache_data`) extensively for analytics functions.
+3.  **Displaying Metrics:**
+    *   ✅ Use `st.metric`, `st.dataframe`, `st.table` to display numerical results.
+4.  **Visualizations:**
+    *   ✅ Integrate with Plotly for visualizations:
+        *   ✅ Token Holdings Pie Chart
+        *   ✅ Most Used Assets Bar Chart
+        *   ✅ Other Protocol Usage Bar Chart
+        *   ✅ User Net Worth Distribution
+        *   ✅ Chain Distribution Bar Chart
+        *   ✅ Lending vs. Looping Assets Bar Charts
+        *   ✅ Loop Factor Distribution Pie Chart
+        *   ✅ TVL by User Size Distribution Pie Chart
+        *   ✅ Portfolio Strategy Analysis Section (with pie chart and metrics)
+        *   ✅ Position Duration Chart (with fallback for missing data)
+        *   ✅ Chain Comparison Analytics Dashboard
+        *   ✅ User Behavior Analysis Dashboard with Segments
+5.  **Interactivity:**
+    *   ✅ Add basic data refresh control.
+    *   ✅ Add more filters (e.g., by chain, time period).
+6.  **Styling:**
+    *   ✅ Apply clean, professional styling.
+    *   ✅ Apply specific LoopFi branding elements.
+
+**Phase 4.5: Advanced Analytics Implementation (Complete)**
+
+1.  **Schema Enhancements:**
+    *   ✅ Resolve PostgREST and Supabase query issues by implementing client-side aggregation
+    *   ✅ Fixed user count calculation to count unique users across chains
+    *   ✅ Fix looping assets extraction from debt_tokens JSON data
+    *   ✅ Fix position duration calculation with appropriate fallback
+    *   ⏳ Update database schema to support position duration tracking:
+        *   Add entry_timestamp and last_update_timestamp to debank_user_loopfi_positions table
+        *   Add appropriate indices for efficient querying
+2.  **Additional Metrics:**
+    *   ✅ Implement Risk Analysis with Loop Factor visualization
+    *   ✅ Add dedicated Lending vs. Looping asset analysis
+    *   ✅ Implement TVL distribution by user size analysis
+    *   ✅ Add Portfolio Strategy Analysis section
+    *   ✅ Create Chain Comparison Analytics
+    *   ✅ Implement User Behavior Clustering and Segmentation
+    *   ⏳ Enhance Position Duration analysis functionality
+
+**Phase 5: Testing & Refinement (Ongoing)**
+
+1.  **Unit Testing:**
+    *   Add basic unit tests for core logic (future step).
+2.  **Data Validation:**
+    *   ✅ Check fetched data against DeBank UI for sanity (manual step).
+3.  **UI/UX Testing:**
+    *   ✅ Test the Streamlit app for clarity, responsiveness, and usability.
+4.  **Performance Optimization:**
+    *   ✅ Review query performance in Supabase.
+    *   ✅ Optimize caching strategies.
+    *   ✅ Implement client-side aggregation for better performance and reliability
+5.  **Refactor:**
+    *   ✅ Improve code structure and clarity based on reviews.
+    *   ✅ Fix issues related to PostgREST API limitations
+
+---
+
+**Current Tasks:**
+
+1.  ⏳ Update Supabase schema to add missing columns:
+    *   Add entry_timestamp and last_update_timestamp to track position duration
+    *   Add asset_symbol and debt_symbol columns which are missing in the current schema
+2.  ⏳ Run the full data collection pipeline to populate all tables:
+    *   `source venv/bin/activate && python -m scripts.run_pipeline --full`
+3.  ⏳ Update data collection pipeline to track position timestamps
+4.  ✅ Complete the Position Duration analysis implementation with appropriate fallbacks
+5.  ✅ Implement Portfolio Strategy Analysis section
+6.  ✅ Implement Chain Comparison Analytics
+7.  ✅ Implement User Behavior Segmentation
+
+**Future Enhancements:**
+
+1.  Implement User Retention Dashboard to track user activity over time
+2.  Add time-series analytics to visualize protocol growth and user adoption
+3.  Create Predictive Analytics modules to forecast TVL and user growth
+4.  Add export functionality for data and charts
+5.  Implement automated scheduled data collection
+6.  Add user authentication for the dashboard
+7.  Create a mobile-friendly version of the dashboard
+8.  Implement alert system for significant changes in key metrics
