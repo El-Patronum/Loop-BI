@@ -67,45 +67,81 @@ def get_most_used_assets(supabase: Client, limit: int = 10) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def calculate_loop_factors(supabase: Client) -> Tuple[pd.DataFrame, float]:
+def calculate_loop_factors(supabase: Client) -> pd.DataFrame:
     """
-    Calculate the loop factors (leverage) for positions with debt.
-    Loop factor = debt_usd_value / asset_usd_value
+    Calculate the distribution of loop factors (leverage ratios).
     
     Args:
         supabase: A Supabase client instance
         
     Returns:
-        Tuple containing (DataFrame with loop_factor distribution, average loop factor)
+        DataFrame with loop factor distribution, including all categories, sorted by range.
     """
-    response = supabase.table("debank_user_loopfi_positions").select(
-        "user_address", "asset_usd_value", "debt_usd_value"
-    ).gt("debt_usd_value", 0).execute()
-    
-    if not response.data:
-        return pd.DataFrame(), 0
-    
-    df = pd.DataFrame(response.data)
-    
-    # Calculate loop factor (debt/asset ratio)
-    df['loop_factor'] = df['debt_usd_value'] / df['asset_usd_value']
-    
-    # Remove extreme values or NaNs
-    df = df[df['loop_factor'].between(0, 1)]
-    
-    # Create distribution bins
-    bins = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
-    labels = ['0-20%', '20-40%', '40-60%', '60-80%', '80-100%']
-    df['risk_category'] = pd.cut(df['loop_factor'], bins=bins, labels=labels)
-    
-    # Get counts by category
-    risk_counts = df['risk_category'].value_counts().reset_index()
-    risk_counts.columns = ['factor_range', 'count']
-    
-    # Calculate average loop factor
-    avg_loop_factor = df['loop_factor'].mean()
-    
-    return risk_counts, avg_loop_factor
+    # Define structure for empty DataFrame to ensure consistency
+    labels = ['0-25%', '25-50%', '50-75%', '75-100%', '100-150%', '150-200%', '200-300%', '300%+']
+    empty_df = pd.DataFrame({
+        'loop_factor_range': pd.Categorical(labels, categories=labels, ordered=True),
+        'count': pd.Series([0]*len(labels), dtype='int')
+    }).sort_values('loop_factor_range') # Ensure empty df is sorted too
+
+    try:
+        response = supabase.table("debank_user_loopfi_positions").select(
+            "asset_usd_value", "debt_usd_value"
+        ).execute()
+        
+        if not response.data:
+            return empty_df
+            
+        df = pd.DataFrame(response.data)
+        df['asset_usd_value'] = pd.to_numeric(df['asset_usd_value'], errors='coerce').fillna(0)
+        df['debt_usd_value'] = pd.to_numeric(df['debt_usd_value'], errors='coerce').fillna(0)
+        
+        # Consider only positions with debt (looping positions)
+        df = df[df['debt_usd_value'] > 0].copy() # Use .copy() to avoid SettingWithCopyWarning
+        if df.empty:
+            return empty_df
+        
+        # Calculate loop factor, handling potential division by zero
+        df['loop_factor'] = df['debt_usd_value'] / df['asset_usd_value'].replace(0, np.nan)
+        
+        # Handle cases where loop_factor calculation resulted in NaN
+        df.dropna(subset=['loop_factor'], inplace=True)
+        if df.empty:
+            return empty_df
+
+        # Create bins for loop factors
+        bins = [0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, float('inf')]
+        # Explicitly use Categorical with all defined labels/categories
+        df['loop_factor_range'] = pd.cut(df['loop_factor'], bins=bins, labels=labels, right=False)
+        df['loop_factor_range'] = df['loop_factor_range'].astype('category').cat.set_categories(labels, ordered=True)
+
+        # Get counts by loop factor range
+        counts = df['loop_factor_range'].value_counts()
+
+        # Reindex with all labels to ensure all categories are present, fill missing with 0
+        counts = counts.reindex(labels, fill_value=0)
+
+        # Create the final DataFrame directly from the reindexed Series
+        loop_factor_counts_df = pd.DataFrame({
+            'loop_factor_range': counts.index, # Index contains the labels
+            'count': counts.values
+        })
+
+        # Explicitly set the categorical type and order on the column
+        loop_factor_counts_df['loop_factor_range'] = pd.Categorical(
+            loop_factor_counts_df['loop_factor_range'],
+            categories=labels,
+            ordered=True
+        )
+
+        # Sort by the categorical range for consistent order before returning
+        return loop_factor_counts_df.sort_values('loop_factor_range')
+
+    except Exception as e:
+        # Log the error (replace with proper logging if available)
+        print(f"Error in calculate_loop_factors: {e}")
+        # Return the predefined empty DataFrame on any error
+        return empty_df
 
 
 def get_user_token_distribution(supabase: Client, chain_id: Optional[str] = None) -> pd.DataFrame:
@@ -179,28 +215,42 @@ def get_other_protocol_usage(supabase: Client, limit: int = 10) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def calculate_utilization_rate(supabase: Client) -> float:
+def calculate_utilization_rate(supabase: Client) -> Tuple[float, float]:
     """
-    Calculate the utilization rate (borrowing vs. lending ratio).
+    Calculate the overall and looping-specific utilization rates.
+    Utilization = Total Debt / Total Collateral (Assets)
     
     Args:
         supabase: A Supabase client instance
         
     Returns:
-        The utilization rate as a fraction
+        Tuple containing (overall_utilization_rate, looping_specific_utilization_rate)
     """
     # Client-side calculation instead of SQL aggregation
     response = supabase.table("debank_user_loopfi_positions").select(
         "debt_usd_value", "asset_usd_value"
     ).execute()
     
-    if response.data:
-        debt_sum = sum(item.get('debt_usd_value', 0) for item in response.data)
-        asset_sum = sum(item.get('asset_usd_value', 0) for item in response.data)
-        if asset_sum > 0:
-            return debt_sum / asset_sum
+    overall_utilization_rate = 0.0
+    looping_specific_utilization_rate = 0.0
     
-    return 0.0
+    if response.data:
+        df = pd.DataFrame(response.data)
+        df['debt_usd_value'] = df['debt_usd_value'].fillna(0)
+        df['asset_usd_value'] = df['asset_usd_value'].fillna(0)
+
+        # Overall rate
+        total_debt = df['debt_usd_value'].sum()
+        total_asset = df['asset_usd_value'].sum()
+        overall_utilization_rate = total_debt / total_asset if total_asset > 0 else 0.0
+        
+        # Looping-specific rate
+        looping_df = df[df['debt_usd_value'] > 0]
+        looping_debt = looping_df['debt_usd_value'].sum()
+        looping_asset = looping_df['asset_usd_value'].sum()
+        looping_specific_utilization_rate = looping_debt / looping_asset if looping_asset > 0 else 0.0
+            
+    return overall_utilization_rate, looping_specific_utilization_rate
 
 
 def calculate_average_net_worth(supabase: Client) -> float:
@@ -271,229 +321,258 @@ def calculate_whale_distribution(supabase: Client, whale_threshold: float = 1000
     }
 
 
-def get_assets_by_role(supabase: Client, role: str = 'both') -> pd.DataFrame:
+def get_assets_by_role(supabase: Client, role: str = 'both', chain_filter=None) -> pd.DataFrame:
     """
     Get analysis of assets based on their role (lending or looping/debt).
     
     Args:
         supabase: A Supabase client instance
         role: Which role to analyze - 'lending', 'looping', or 'both'
+        chain_filter: Optional chain to filter by (e.g., 'ETH', 'BSC')
         
     Returns:
-        DataFrame with asset analysis by their role
+        DataFrame containing asset data for the specified role(s).
+        Columns vary based on role.
     """
-    # Fetch positions data
-    response = supabase.table("debank_user_loopfi_positions").select(
-        "user_address", "asset_symbol", "debt_symbol", "supplied_tokens", "debt_tokens", 
-        "asset_usd_value", "debt_usd_value", "chain_id"
-    ).execute()
+    # Build query with optional chain filter
+    query = supabase.table("debank_user_loopfi_positions").select(
+        "asset_symbol", "asset_usd_value", "debt_usd_value", 
+        "chain_id", "supplied_tokens", "debt_tokens"
+    )
+    
+    # Apply chain filter if specified
+    if chain_filter and chain_filter.lower() != "all chains":
+        query = query.eq("chain_id", chain_filter.lower())
+    
+    response = query.execute()
     
     if not response.data:
         return pd.DataFrame()
     
-    # Convert to pandas DataFrame
     df = pd.DataFrame(response.data)
     
-    # Debug: Print counts of assets
-    asset_count = df['asset_symbol'].notna().sum()
-    debt_count = df['debt_symbol'].notna().sum()
-    print(f"Asset symbols: {asset_count}, Debt symbols: {debt_count} out of {len(df)} positions")
-    
-    # Handle missing asset_symbol or debt_symbol by extracting from JSON
-    for index, row in df.iterrows():
-        if pd.isna(row['asset_symbol']) and row['supplied_tokens']:
-            try:
-                supplied = json.loads(row['supplied_tokens']) if isinstance(row['supplied_tokens'], str) else row['supplied_tokens']
-                if supplied and len(supplied) > 0:
-                    df.at[index, 'asset_symbol'] = supplied[0].get('symbol')
-                    if pd.isna(row['chain_id']) and supplied[0].get('chain'):
-                        df.at[index, 'chain_id'] = supplied[0].get('chain')
-            except Exception as e:
-                print(f"Error extracting asset symbol: {e}")
-                
-        if pd.isna(row['debt_symbol']) and row['debt_tokens']:
-            try:
-                # Handle both string and already-parsed JSON
-                debt = json.loads(row['debt_tokens']) if isinstance(row['debt_tokens'], str) else row['debt_tokens']
-                if debt and len(debt) > 0:
-                    df.at[index, 'debt_symbol'] = debt[0].get('symbol')
-                    if pd.isna(row['chain_id']) and debt[0].get('chain'):
-                        df.at[index, 'chain_id'] = debt[0].get('chain')
-            except Exception as e:
-                print(f"Error extracting debt symbol: {e}")
-    
-    # Count assets after extraction
-    asset_count_after = df['asset_symbol'].notna().sum()
-    debt_count_after = df['debt_symbol'].notna().sum()
-    print(f"After extraction - Asset symbols: {asset_count_after}, Debt symbols: {debt_count_after}")
-    
-    # Create the analysis based on the role
-    lending_analysis = pd.DataFrame()
-    looping_analysis = pd.DataFrame()
-    
-    if role == 'lending' or role == 'both':
-        lending_df = df.dropna(subset=['asset_symbol'])
-        if len(lending_df) > 0:
-            lending_analysis = lending_df.groupby(['asset_symbol', 'chain_id']).agg({
-                'asset_usd_value': 'sum',
-                'user_address': 'nunique'
-            }).reset_index()
-            lending_analysis.columns = ['asset_symbol', 'chain_id', 'total_usd_value', 'user_count']
-            lending_analysis = lending_analysis.sort_values('total_usd_value', ascending=False)
-            lending_analysis['role'] = 'lending'
-        
-    if role == 'looping' or role == 'both':
-        # For looping assets, check for both debt_symbol and debt_usd_value
-        looping_df = df.dropna(subset=['debt_symbol'])
-        looping_df = looping_df[looping_df['debt_usd_value'] > 0]
-        
-        if len(looping_df) > 0:
-            looping_analysis = looping_df.groupby(['debt_symbol', 'chain_id']).agg({
-                'debt_usd_value': 'sum',
-                'user_address': 'nunique'
-            }).reset_index()
-            looping_analysis.columns = ['asset_symbol', 'chain_id', 'total_usd_value', 'user_count']
-            looping_analysis = looping_analysis.sort_values('total_usd_value', ascending=False)
-            looping_analysis['role'] = 'looping'
-    
-    # Return based on requested role
-    if role == 'lending':
-        return lending_analysis
-    elif role == 'looping':
-        return looping_analysis
-    else:
-        # Combine both analyses
-        if len(lending_analysis) > 0 and len(looping_analysis) > 0:
-            return pd.concat([lending_analysis, looping_analysis], ignore_index=True)
-        elif len(lending_analysis) > 0:
-            return lending_analysis
-        elif len(looping_analysis) > 0:
-            return looping_analysis
+    # Ensure required columns exist and are properly formatted
+    for col in ['asset_symbol', 'asset_usd_value', 'debt_usd_value', 'chain_id']:
+        if col not in df.columns:
+            df[col] = 'Unknown' if col == 'asset_symbol' or col == 'chain_id' else 0
         else:
+            if col in ['asset_usd_value', 'debt_usd_value']:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    # Filter by role as needed
+    if role == 'lending':
+        # For lending, get positions with no debt or very small debt (might be dust)
+        df = df[df['debt_usd_value'] <= 0.01].copy()
+        
+        # Group by asset and chain
+        grouped = df.groupby(['asset_symbol', 'chain_id'], observed=True).agg(
+            total_usd_value=('asset_usd_value', 'sum'),
+            position_count=('asset_usd_value', 'count')
+        ).reset_index()
+        
+        # Add role column
+        grouped['role'] = 'lending'
+        
+        return grouped.sort_values('total_usd_value', ascending=False)
+    
+    elif role == 'looping':
+        # For looping, get positions with debt
+        df = df[df['debt_usd_value'] > 0.01].copy()
+        
+        # This is a bit more complex as we need to extract the borrowed asset from debt_tokens
+        looping_positions = []
+        
+        for _, row in df.iterrows():
+            # Try to extract the borrowed token
+            borrowed_asset = 'Unknown'
+            borrowed_amount = 0
+            
+            try:
+                if row.get('debt_tokens') and isinstance(row['debt_tokens'], str):
+                    debt_tokens = json.loads(row['debt_tokens'])
+                    if isinstance(debt_tokens, list) and len(debt_tokens) > 0:
+                        first_token = debt_tokens[0]
+                        borrowed_asset = first_token.get('symbol', 'Unknown')
+                        borrowed_amount = first_token.get('amount', 0)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+            
+            # Add to positions list
+            looping_positions.append({
+                'asset_symbol': row.get('asset_symbol', 'Unknown'),
+                'borrowed_asset_symbol': borrowed_asset,
+                'chain_id': row.get('chain_id', 'Unknown'),
+                'asset_usd_value': row.get('asset_usd_value', 0),
+                'debt_usd_value': row.get('debt_usd_value', 0),
+                'net_usd_value': row.get('asset_usd_value', 0) - row.get('debt_usd_value', 0)
+            })
+        
+        if not looping_positions:
             return pd.DataFrame()
+            
+        looping_df = pd.DataFrame(looping_positions)
+        
+        # Group by collateral asset and chain
+        grouped = looping_df.groupby(['asset_symbol', 'chain_id'], observed=True).agg(
+            total_usd_value=('asset_usd_value', 'sum'),
+            total_debt_value=('debt_usd_value', 'sum'),
+            position_count=('asset_symbol', 'count')
+        ).reset_index()
+        
+        # Add role column
+        grouped['role'] = 'looping'
+        
+        return grouped.sort_values('total_usd_value', ascending=False)
+        
+    else:  # both
+        # Get both lending and looping positions
+        lending_df = get_assets_by_role(supabase, 'lending', chain_filter)
+        looping_df = get_assets_by_role(supabase, 'looping', chain_filter)
+        
+        # Combine the results
+        if lending_df.empty and looping_df.empty:
+            return pd.DataFrame()
+        elif lending_df.empty:
+            return looping_df
+        elif looping_df.empty:
+            return lending_df
+        else:
+            # Ensure columns match before concatenating
+            common_cols = ['asset_symbol', 'chain_id', 'total_usd_value', 'position_count', 'role']
+            return pd.concat([
+                lending_df[common_cols], 
+                looping_df[common_cols]
+            ], ignore_index=True)
 
 
-def get_position_duration(supabase: Client) -> Tuple[pd.DataFrame, float, bool]:
+def get_position_duration_analytics(supabase: Client, chain_filter=None) -> Tuple[pd.DataFrame, float, bool]:
     """
-    Get the distribution of position durations.
+    Calculate position duration distribution statistics.
     
     Args:
         supabase: A Supabase client instance
+        chain_filter: Optional chain to filter by (e.g., 'ETH', 'BSC')
         
     Returns:
-        Tuple containing (DataFrame with duration distribution, average duration in days, has_real_data flag)
+        Tuple containing:
+            - DataFrame with duration distribution (bins and counts)
+            - Average duration in days
+            - Boolean indicating if real data is available
     """
-    response = supabase.table("debank_user_loopfi_positions").select(
-        "entry_timestamp", "last_updated_timestamp"
-    ).execute()
-    
-    if not response.data or len(response.data) == 0:
-        # Return placeholder data as fallback
-        placeholder_data = {
-            'duration_range': ['0-7 days', '7-30 days', '30-90 days', '90+ days'],
-            'count': [0, 0, 0, 0]
-        }
-        return pd.DataFrame(placeholder_data), 0, False
-    
-    df = pd.DataFrame(response.data)
-    
-    # Check if we have identical timestamps for all entries (data migration artifact)
-    entry_timestamps = pd.to_datetime(df['entry_timestamp'], errors='coerce')
-    update_timestamps = pd.to_datetime(df['last_updated_timestamp'], errors='coerce')
-    
-    # If all timestamps are within 1 hour of each other, it's likely migration data
-    unique_entries = entry_timestamps.nunique()
-    unique_updates = update_timestamps.nunique()
-    
-    # Debug info
-    print(f"Position timestamps - Unique entry timestamps: {unique_entries}, Unique update timestamps: {unique_updates}")
-    
-    # Check if the timestamps represent real duration data or migration artifacts
-    has_real_data = False
-    
-    # If we have very few unique timestamps or they're all clustered together, likely not real data
-    if unique_entries <= 3 or unique_updates <= 3:
-        print("Position duration data appears to be migration artifacts rather than real position durations")
-        # Generate a synthetic distribution as a placeholder
-        # For display purposes, create a distribution that shows most positions are new
-        duration_counts = pd.DataFrame({
-            'duration_range': ['0-7 days', '7-30 days', '30-90 days', '90+ days'],
-            'count': [len(df), 0, 0, 0]  # All positions classified as "new"
-        })
-        return duration_counts, 0, False
-    
-    # If we're here, we have real timestamp data
-    # Convert timestamps to datetime objects
-    df['entry_timestamp'] = entry_timestamps
-    df['last_updated_timestamp'] = update_timestamps
-    
-    # Remove rows with invalid timestamps
-    df = df.dropna(subset=['entry_timestamp', 'last_updated_timestamp'])
-    
-    if len(df) == 0:
-        # If no valid data after cleaning, return placeholder
-        placeholder_data = {
-            'duration_range': ['0-7 days', '7-30 days', '30-90 days', '90+ days'],
-            'count': [0, 0, 0, 0]
-        }
-        return pd.DataFrame(placeholder_data), 0, False
-    
-    # Force entry_timestamp to be before or equal to last_updated_timestamp
-    df = df[df['entry_timestamp'] <= df['last_updated_timestamp']]
-    
-    # Calculate duration in days
-    df['duration_days'] = (df['last_updated_timestamp'] - df['entry_timestamp']).dt.total_seconds() / (60*60*24)
-    
-    # Check for negative durations (shouldn't happen after the above filter, but just in case)
-    df = df[df['duration_days'] >= 0]
-    
-    # Create duration bins
-    bins = [0, 7, 30, 90, float('inf')]
-    labels = ['0-7 days', '7-30 days', '30-90 days', '90+ days']
-    df['duration_range'] = pd.cut(df['duration_days'], bins=bins, labels=labels)
-    
-    # Get counts by duration range and ensure all bins are represented
-    all_ranges = pd.Series(labels, name='duration_range')
-    counts = df['duration_range'].value_counts()
-    duration_counts = pd.DataFrame({
-        'duration_range': all_ranges,
-        'count': [counts.get(r, 0) for r in labels]
+    # Default empty data with standard bins
+    bins = ["0-7 days", "7-30 days", "1-3 months", "3-6 months", "6-12 months", ">12 months"]
+    duration_data = pd.DataFrame({
+        'duration_range': bins,
+        'count': [0] * len(bins)
     })
     
-    # Calculate average duration (limit to reasonable values, e.g., max 1 year)
-    reasonable_df = df[df['duration_days'] <= 365]
-    avg_duration = reasonable_df['duration_days'].mean() if len(reasonable_df) > 0 else 0
+    # Check if we have real duration data
+    has_real_data = False
+    avg_duration = 0
     
-    return duration_counts, avg_duration, True
+    try:
+        # Build query with optional chain filter
+        query = supabase.table("debank_position_duration").select(
+            "position_id", "user_address", "chain_id", "duration_days", "is_active"
+        )
+        
+        # Apply chain filter if specified
+        if chain_filter and chain_filter.lower() != "all chains":
+            query = query.eq("chain_id", chain_filter.lower())
+        
+        response = query.execute()
+        
+        if response.data and len(response.data) > 0:
+            df = pd.DataFrame(response.data)
+            
+            # Check if we have real duration_days data
+            if 'duration_days' in df.columns and not df['duration_days'].isnull().all():
+                has_real_data = True
+                
+                # Fill NaNs
+                df['duration_days'] = df['duration_days'].fillna(0)
+                
+                # Calculate average duration
+                avg_duration = df['duration_days'].mean()
+                
+                # Create bins for the chart
+                conditions = [
+                    (df['duration_days'] < 7),
+                    (df['duration_days'] >= 7) & (df['duration_days'] < 30),
+                    (df['duration_days'] >= 30) & (df['duration_days'] < 90),
+                    (df['duration_days'] >= 90) & (df['duration_days'] < 180),
+                    (df['duration_days'] >= 180) & (df['duration_days'] < 365),
+                    (df['duration_days'] >= 365)
+                ]
+                
+                # Apply binning
+                df['duration_range'] = np.select(conditions, bins, default="Unknown")
+                
+                # Count positions per duration range
+                duration_counts = df['duration_range'].value_counts().reset_index()
+                duration_counts.columns = ['duration_range', 'count']
+                
+                # Ensure all categories are represented in the correct order
+                duration_data = pd.DataFrame({'duration_range': bins})
+                duration_data = duration_data.merge(duration_counts, on='duration_range', how='left')
+                duration_data['count'] = duration_data['count'].fillna(0).astype(int)
+                
+                # Add categorical type to ensure correct order
+                duration_data['duration_range'] = pd.Categorical(
+                    duration_data['duration_range'], 
+                    categories=bins,
+                    ordered=True
+                )
+                
+                # Sort by duration range
+                duration_data = duration_data.sort_values('duration_range')
+    except Exception as e:
+        # Handle the case where the table doesn't exist or other errors
+        print(f"Error getting position duration data: {str(e)}")
+        # Return default empty data with has_real_data = False
+    
+    return duration_data, avg_duration, has_real_data
 
 
-def get_portfolio_strategy_analysis(supabase: Client) -> Tuple[pd.DataFrame, Dict[str, float]]:
+def get_portfolio_strategy_analysis(supabase: Client, chain_filter=None) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
     Analyzes positions by portfolio strategy type (Staked, Yield, Leveraged Farming).
     
     Args:
         supabase: A Supabase client instance
+        chain_filter: Optional chain to filter by (e.g., 'ETH', 'BSC')
         
     Returns:
         Tuple containing (DataFrame with strategy distribution, Dict with strategy-specific metrics)
     """
-    response = supabase.table("debank_user_loopfi_positions").select(
+    # Build query with optional chain filter
+    query = supabase.table("debank_user_loopfi_positions").select(
         "portfolio_item_name", "asset_usd_value", "debt_usd_value", "user_address", "chain_id"
-    ).execute()
+    )
+    
+    # Apply chain filter if specified
+    if chain_filter and chain_filter.lower() != "all chains":
+        query = query.eq("chain_id", chain_filter.lower())
+    
+    response = query.execute()
     
     if not response.data or len(response.data) == 0:
         return pd.DataFrame(), {}
     
     df = pd.DataFrame(response.data)
     
-    # Ensure required columns exist
+    # Ensure required columns exist and fill missing values
     for col in ['portfolio_item_name', 'asset_usd_value', 'debt_usd_value']:
         if col not in df.columns:
-            df[col] = 0
+            df[col] = 0 # Or appropriate default
+        else:
+            # Ensure numeric columns are numeric, coercing errors
+            if col in ['asset_usd_value', 'debt_usd_value']:
+                 df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = df[col].fillna(0)
     
-    # Fill missing values
-    df['asset_usd_value'] = df['asset_usd_value'].fillna(0)
-    df['debt_usd_value'] = df['debt_usd_value'].fillna(0)
+    # Fill NaNs in portfolio_item_name with 'Unknown'
+    df['portfolio_item_name'] = df['portfolio_item_name'].fillna('Unknown')
     
     # Get strategy counts
     strategy_counts = df['portfolio_item_name'].value_counts().reset_index()
@@ -511,17 +590,36 @@ def get_portfolio_strategy_analysis(supabase: Client) -> Tuple[pd.DataFrame, Dic
     
     # Compute metrics for each strategy
     for strategy, group in grouped:
+        # Filter for looping positions within this strategy group
+        looping_group = group[group['debt_usd_value'] > 0]
+        
+        # Calculate looping-specific average leverage
+        total_looping_debt = looping_group['debt_usd_value'].sum()
+        total_looping_asset = looping_group['asset_usd_value'].sum()
+        avg_looping_leverage = total_looping_debt / total_looping_asset if total_looping_asset > 0 else 0
+        
+        # Calculate looping-specific average net value
+        looping_group['net_usd_value'] = looping_group['asset_usd_value'] - looping_group['debt_usd_value']
+        avg_looping_net_value = looping_group['net_usd_value'].mean() if not looping_group.empty else 0
+
+        # Calculate overall average leverage for the strategy (includes non-looping)
+        total_strategy_debt = group['debt_usd_value'].sum()
+        total_strategy_asset = group['asset_usd_value'].sum()
+        avg_overall_leverage = total_strategy_debt / total_strategy_asset if total_strategy_asset > 0 else 0
+
         metrics[strategy] = {
             'avg_size': group['asset_usd_value'].mean(),
-            'total_value': group['asset_usd_value'].sum(),
+            'total_value': total_strategy_asset, # Use pre-calculated sum
             'user_count': group['user_address'].nunique(),
-            'avg_leverage': group['debt_usd_value'].sum() / max(group['asset_usd_value'].sum(), 1),
+            'avg_overall_leverage': avg_overall_leverage, # Leverage across all positions in strategy
+            'avg_looping_leverage': avg_looping_leverage, # Leverage specifically for looping positions in strategy
+            'avg_looping_net_value': avg_looping_net_value, # Added avg net value for looping positions
             'chain_distribution': group['chain_id'].value_counts().to_dict()
         }
     
     # Calculate percentage for each strategy
     total_positions = strategy_counts['count'].sum()
-    strategy_counts['percentage'] = strategy_counts['count'] / total_positions * 100
+    strategy_counts['percentage'] = (strategy_counts['count'] / total_positions * 100).round(2)
     
     return strategy_counts, metrics
 
@@ -666,6 +764,17 @@ def compare_chains_metrics(supabase: Client) -> pd.DataFrame:
             
             util_rate = debt_sum / asset_sum if asset_sum > 0 else 0
             chain_metrics[chain]['utilization_rate'] = util_rate
+            
+            # Calculate looping-specific metrics
+            looping_group = group[group['debt_usd_value'] > 0]
+            looping_asset_sum = looping_group['asset_usd_value'].sum()
+            looping_debt_sum = looping_group['debt_usd_value'].sum()
+            
+            looping_tvl_percentage = (looping_asset_sum / asset_sum * 100) if asset_sum > 0 else 0
+            looping_utilization_rate = looping_debt_sum / looping_asset_sum if looping_asset_sum > 0 else 0
+            
+            chain_metrics[chain]['looping_tvl_percentage'] = looping_tvl_percentage
+            chain_metrics[chain]['looping_utilization_rate'] = looping_utilization_rate
     
     # 5. Get portfolio strategy distribution per chain
     response = supabase.table("debank_user_loopfi_positions").select(
@@ -736,42 +845,57 @@ def compare_chains_metrics(supabase: Client) -> pd.DataFrame:
     return comparison_df
 
 
-def analyze_user_behavior(supabase: Client) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def analyze_user_behavior(supabase: Client, chain_filter=None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Analyze user behavior patterns to identify different user segments.
+    Analyzes user behavior and categorizes users into segments.
     
     Args:
         supabase: A Supabase client instance
+        chain_filter: Optional chain to filter by (e.g., 'ETH', 'BSC')
         
     Returns:
-        Tuple containing (DataFrame with user classifications, Dict with segment insights)
+        Tuple containing (DataFrame with user segments, Dict with segment insights)
     """
-    # 1. Fetch user positions data
-    position_response = supabase.table("debank_user_loopfi_positions").select(
-        "user_address", "asset_usd_value", "debt_usd_value", "chain_id", "portfolio_item_name"
-    ).execute()
+    # Fetch position data for analysis
+    position_query = supabase.table("debank_user_loopfi_positions").select(
+        "user_address", "portfolio_item_name", "asset_usd_value", 
+        "debt_usd_value", "chain_id"
+    )
     
-    # 2. Fetch user protocol interactions 
-    protocol_response = supabase.table("debank_user_protocol_interactions").select(
-        "user_address", "protocol_id"
-    ).execute()
+    # Apply chain filter to positions if specified
+    if chain_filter and chain_filter.lower() != "all chains":
+        position_query = position_query.eq("chain_id", chain_filter.lower())
     
-    # 3. Fetch user token holdings
-    token_response = supabase.table("debank_user_token_holdings").select(
-        "user_address", "token_symbol", "usd_value"
-    ).execute()
+    position_response = position_query.execute()
     
-    # 4. Fetch user net worth
+    # Fetch protocol interaction data
+    protocol_query = supabase.table("debank_user_protocol_interactions").select(
+        "user_address", "protocol_id", "chain_id"
+    )
+    
+    # Apply chain filter to protocol interactions if specified
+    if chain_filter and chain_filter.lower() != "all chains":
+        protocol_query = protocol_query.eq("chain_id", chain_filter.lower())
+    
+    protocol_response = protocol_query.execute()
+    
+    # Fetch user data (including loopfi users)
+    # Note: For user data, we'll need to filter after fetching since we don't have chain_id in this table
     user_response = supabase.table("debank_loopfi_users").select(
-        "user_address", "loopfi_usd_value", "total_net_worth_usd", "chain_id"
+        "user_address", "loopfi_usd_value", "total_net_worth_usd"
     ).execute()
     
-    # Initialize dictionaries to store user behavior metrics
+    # Initialize user metrics dictionary
     user_metrics = {}
     
     # Process position data
     if position_response.data:
         positions_df = pd.DataFrame(position_response.data)
+        
+        # If we have a chain filter, get the list of users who have positions on this chain
+        chain_filtered_users = None
+        if chain_filter and chain_filter.lower() != "all chains":
+            chain_filtered_users = set(positions_df['user_address'].unique())
         
         # Count positions per user
         position_counts = positions_df.groupby('user_address').size()
@@ -813,35 +937,13 @@ def analyze_user_behavior(supabase: Client) -> Tuple[pd.DataFrame, Dict[str, Any
             
             user_metrics[user]['protocol_count'] = protocol_counts.get(user, 0)
     
-    # Process token holding data
-    if token_response.data:
-        tokens_df = pd.DataFrame(token_response.data)
-        
-        # Count unique tokens per user
-        token_counts = tokens_df.groupby('user_address')['token_symbol'].nunique()
-        
-        # Calculate portfolio diversity
-        portfolio_diversity = {}
-        for user in token_counts.index:
-            user_tokens = tokens_df[tokens_df['user_address'] == user]
-            total_value = user_tokens['usd_value'].sum()
-            if total_value > 0:
-                # Count tokens that make up at least 5% of portfolio
-                significant = (user_tokens['usd_value'] / total_value) >= 0.05
-                portfolio_diversity[user] = significant.sum()
-            else:
-                portfolio_diversity[user] = 0
-        
-        for user in token_counts.index:
-            if user not in user_metrics:
-                user_metrics[user] = {}
-            
-            user_metrics[user]['token_count'] = token_counts.get(user, 0)
-            user_metrics[user]['portfolio_diversity'] = portfolio_diversity.get(user, 0)
-    
     # Process user net worth data
     if user_response.data:
         users_df = pd.DataFrame(user_response.data)
+        
+        # If we have chain filtered users, only keep those users
+        if chain_filter and chain_filter.lower() != "all chains" and chain_filtered_users is not None:
+            users_df = users_df[users_df['user_address'].isin(chain_filtered_users)]
         
         # Get TVL and net worth for each user
         user_tvl = users_df.groupby('user_address')['loopfi_usd_value'].sum()
@@ -887,54 +989,50 @@ def analyze_user_behavior(supabase: Client) -> Tuple[pd.DataFrame, Dict[str, Any
     multichain_criteria = user_df['chain_count'] >= 2
     segments['Multi-Chain Users'] = user_df[multichain_criteria].index.tolist()
     
-    # Casual Users: Low position count, low TVL
-    casual_criteria = (
-        (user_df['position_count'] <= 2) & 
-        (user_df['tvl'] < (whale_threshold * 0.1))
-    )
-    segments['Casual Users'] = user_df[casual_criteria].index.tolist()
-    
-    # Experimental Users: High portfolio diversity
-    experimental_criteria = (
-        (user_df['portfolio_diversity'] >= 5) | 
-        (user_df['strategy_count'] >= 2)
-    )
-    segments['Experimental Users'] = user_df[experimental_criteria].index.tolist()
-    
-    # Risk-Takers: High leverage ratio
+    # Risk-Takers: High leverage
     risk_criteria = user_df['avg_leverage'] >= 0.7
     segments['Risk-Takers'] = user_df[risk_criteria].index.tolist()
     
-    # Add segment classification to DataFrame with priority
+    # Experimental Users: Try multiple strategies
+    exp_criteria = user_df['strategy_count'] >= 2
+    segments['Experimental Users'] = user_df[exp_criteria].index.tolist()
+    
+    # Casual Users: Small TVL, few positions
+    casual_criteria = (
+        (user_df['tvl'] < whale_threshold / 10) & 
+        (user_df['position_count'] < 3)
+    )
+    segments['Casual Users'] = user_df[casual_criteria].index.tolist()
+    
+    # Assign segment to each user (prioritizing more specific segments)
     user_df['user_segment'] = 'Other'
     
+    # Order of priority for segment assignment
     segment_priority = [
-        'Power Users', 
-        'Whales', 
-        'Risk-Takers',
-        'Experimental Users',
-        'Multi-Chain Users',
-        'Casual Users'
+        'Power Users', 'Whales', 'Risk-Takers', 
+        'Experimental Users', 'Multi-Chain Users', 'Casual Users'
     ]
     
     for segment in segment_priority:
-        if segment in segments:
-            user_df.loc[user_df.index.isin(segments[segment]), 'user_segment'] = segment
+        user_df.loc[user_df.index.isin(segments[segment]), 'user_segment'] = segment
     
     # Calculate segment insights
     segment_insights = {}
     
-    segment_counts = user_df['user_segment'].value_counts()
-    for segment, count in segment_counts.items():
-        segment_users = user_df[user_df['user_segment'] == segment]
-        segment_insights[segment] = {
-            'count': count,
-            'total_tvl': segment_users['tvl'].sum(),
-            'avg_positions': segment_users['position_count'].mean(),
-            'avg_tvl': segment_users['tvl'].mean(),
-            'avg_net_worth': segment_users['net_worth'].mean(),
-            'pct_of_users': (count / len(user_df) * 100) if len(user_df) > 0 else 0
-        }
+    for segment, users in segments.items():
+        if users:
+            segment_df = user_df.loc[users]
+            
+            segment_insights[segment] = {
+                'count': len(users),
+                'pct_of_users': len(users) / len(user_df) * 100,
+                'total_tvl': segment_df['tvl'].sum(),
+                'avg_tvl': segment_df['tvl'].mean(),
+                'avg_positions': segment_df['position_count'].mean(),
+                'avg_net_worth': segment_df['net_worth'].mean(),
+                'avg_leverage': segment_df['avg_leverage'].mean(),
+                'multi_chain_pct': (segment_df['chain_count'] > 1).mean() * 100
+            }
     
     return user_df, segment_insights
 
@@ -1009,4 +1107,228 @@ def check_chain_data_quality(supabase: Client) -> Dict[str, Any]:
         "duplicate_count": duplicate_count,
         "user_counts": user_counts.to_dict(),
         "tvl_by_chain": tvl_by_chain.to_dict()
-    } 
+    }
+
+
+def calculate_looping_overview_stats(supabase: Client) -> Dict[str, float]:
+    """
+    Calculate overview statistics about looping positions.
+    
+    Args:
+        supabase: A Supabase client instance
+        
+    Returns:
+        Dictionary containing looping percentage, avg debt, median debt.
+    """
+    response = supabase.table("debank_user_loopfi_positions").select(
+        "debt_usd_value"
+    ).execute()
+    
+    if not response.data:
+        return {
+            "looping_percentage": 0,
+            "average_looping_debt": 0,
+            "median_looping_debt": 0
+        }
+        
+    df = pd.DataFrame(response.data)
+    df['debt_usd_value'] = df['debt_usd_value'].fillna(0)
+    
+    total_positions = len(df)
+    if total_positions == 0:
+        return {
+            "looping_percentage": 0,
+            "average_looping_debt": 0,
+            "median_looping_debt": 0
+        }
+        
+    looping_positions = df[df['debt_usd_value'] > 0]
+    looping_count = len(looping_positions)
+    
+    looping_percentage = (looping_count / total_positions) * 100 if total_positions > 0 else 0
+    
+    if looping_count > 0:
+        average_looping_debt = looping_positions['debt_usd_value'].mean()
+        median_looping_debt = looping_positions['debt_usd_value'].median()
+    else:
+        average_looping_debt = 0
+        median_looping_debt = 0
+        
+    return {
+        "looping_percentage": looping_percentage,
+        "average_looping_debt": average_looping_debt,
+        "median_looping_debt": median_looping_debt
+    }
+
+
+# Function to analyze leverage by different groupings
+def analyze_leverage_by_group(supabase: Client, chain_filter=None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Calculates average leverage for looping positions, grouped by collateral asset and by chain.
+    
+    Args:
+        supabase: A Supabase client instance
+        chain_filter: Optional chain to filter by (e.g., 'ETH', 'BSC')
+        
+    Returns:
+        Tuple containing:
+            - DataFrame with avg leverage per collateral asset.
+            - DataFrame with avg leverage per chain.
+    """
+    # Build query with optional chain filter
+    query = supabase.table("debank_user_loopfi_positions").select(
+        "asset_symbol", "chain_id", "asset_usd_value", "debt_usd_value"
+    ).gt("debt_usd_value", 0) # Only fetch looping positions
+    
+    # Apply chain filter if specified
+    if chain_filter and chain_filter.lower() != "all chains":
+        query = query.eq("chain_id", chain_filter.lower())
+    
+    response = query.execute()
+    
+    if not response.data:
+        return pd.DataFrame(), pd.DataFrame()
+        
+    df = pd.DataFrame(response.data)
+    df['asset_usd_value'] = df['asset_usd_value'].fillna(0)
+    df['debt_usd_value'] = df['debt_usd_value'].fillna(0)
+    df['asset_symbol'] = df['asset_symbol'].fillna('Unknown')
+    df['chain_id'] = df['chain_id'].fillna('Unknown')
+    
+    # --- Group by Collateral Asset ---
+    asset_groups = df.groupby('asset_symbol')
+    leverage_by_asset_list = []
+    for asset, group in asset_groups:
+        total_asset_val = group['asset_usd_value'].sum()
+        total_debt_val = group['debt_usd_value'].sum()
+        avg_leverage = total_debt_val / total_asset_val if total_asset_val > 0 else 0
+        leverage_by_asset_list.append({
+            'asset_symbol': asset,
+            'avg_leverage': avg_leverage,
+            'position_count': len(group),
+            'total_collateral_value': total_asset_val,
+            'total_debt_value': total_debt_val
+        })
+    
+    leverage_by_asset_df = pd.DataFrame(leverage_by_asset_list)
+    leverage_by_asset_df = leverage_by_asset_df.sort_values('avg_leverage', ascending=False)
+
+    # --- Group by Chain ---
+    chain_groups = df.groupby('chain_id')
+    leverage_by_chain_list = []
+    for chain, group in chain_groups:
+        total_asset_val = group['asset_usd_value'].sum()
+        total_debt_val = group['debt_usd_value'].sum()
+        avg_leverage = total_debt_val / total_asset_val if total_asset_val > 0 else 0
+        leverage_by_chain_list.append({
+            'chain_id': chain,
+            'avg_leverage': avg_leverage,
+            'position_count': len(group),
+            'total_collateral_value': total_asset_val,
+            'total_debt_value': total_debt_val
+        })
+        
+    leverage_by_chain_df = pd.DataFrame(leverage_by_chain_list)
+    leverage_by_chain_df = leverage_by_chain_df.sort_values('avg_leverage', ascending=False)
+    
+    return leverage_by_asset_df, leverage_by_chain_df
+
+
+# Function to analyze performance of looping pairs
+def analyze_looping_pair_performance(supabase: Client, chain_filter=None) -> pd.DataFrame:
+    """
+    Calculates average net USD value for looping positions, grouped by collateral and borrowed asset pairs.
+    
+    Args:
+        supabase: A Supabase client instance
+        chain_filter: Optional chain to filter by (e.g., 'ETH', 'BSC')
+        
+    Returns:
+        DataFrame with avg net value per collateral/borrow asset pair.
+    """
+    # Use the get_assets_by_role function to get the detailed looping data
+    # This avoids repeating the JSON parsing logic
+    looping_data = get_assets_by_role(supabase, role='looping', chain_filter=chain_filter)
+    
+    if looping_data.empty or 'borrowed_asset_symbol' not in looping_data.columns:
+        return pd.DataFrame()
+        
+    # Calculate net_usd_value for each position record
+    # Note: get_assets_by_role returns aggregated data, we need raw positions
+    # Re-fetch raw data for this specific analysis
+    query = supabase.table("debank_user_loopfi_positions").select(
+        "user_address", "supplied_tokens", "debt_tokens", 
+        "asset_usd_value", "debt_usd_value", "chain_id"
+    ).gt("debt_usd_value", 0) # Only looping positions
+    
+    # Apply chain filter if specified
+    if chain_filter and chain_filter.lower() != "all chains":
+        query = query.eq("chain_id", chain_filter.lower())
+    
+    response = query.execute()
+    
+    if not response.data:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(response.data)
+
+    # --- Re-parse minimal info needed: collateral & borrowed symbols --- 
+    parsed_positions = []
+    for _, row in df.iterrows():
+        try:
+            # Try to extract collateral and borrowed symbols
+            collateral_symbol = 'Unknown'
+            borrowed_symbol = 'Unknown'
+            
+            # Handle supplied token case - get first token as collateral
+            if row.get('supplied_tokens') and isinstance(row['supplied_tokens'], str):
+                try:
+                    supplied_tokens = json.loads(row['supplied_tokens'])
+                    if isinstance(supplied_tokens, list) and len(supplied_tokens) > 0:
+                        first_token = supplied_tokens[0]
+                        collateral_symbol = first_token.get('symbol', 'Unknown')
+                except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+                    pass
+                    
+            # Handle debt token case - get first token as borrowed
+            if row.get('debt_tokens') and isinstance(row['debt_tokens'], str):
+                try:
+                    debt_tokens = json.loads(row['debt_tokens'])
+                    if isinstance(debt_tokens, list) and len(debt_tokens) > 0:
+                        first_token = debt_tokens[0]
+                        borrowed_symbol = first_token.get('symbol', 'Unknown')
+                except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+                    pass
+                
+            # Calculate net value    
+            asset_value = row.get('asset_usd_value', 0) or 0
+            debt_value = row.get('debt_usd_value', 0) or 0
+            net_value = asset_value - debt_value
+            
+            # Add to parsed positions list
+            parsed_positions.append({
+                'collateral_symbol': collateral_symbol,
+                'borrowed_symbol': borrowed_symbol,
+                'chain_id': row.get('chain_id', 'Unknown'),
+                'net_usd_value': net_value
+            })
+                
+        except Exception as e:
+            # Skip positions that can't be parsed
+            continue
+    
+    # Create DataFrame from parsed positions
+    if not parsed_positions:
+        return pd.DataFrame()
+        
+    perf_df = pd.DataFrame(parsed_positions)
+    
+    # --- Group by Pair and Chain ---
+    pair_groups = perf_df.groupby(['collateral_symbol', 'borrowed_symbol', 'chain_id'], observed=True).agg(
+        avg_net_usd_value = ('net_usd_value', 'mean'),
+        position_count = ('net_usd_value', 'count') # Count positions for this pair
+    ).reset_index()
+    
+    pair_performance_df = pair_groups.sort_values('avg_net_usd_value', ascending=False)
+    
+    return pair_performance_df 
